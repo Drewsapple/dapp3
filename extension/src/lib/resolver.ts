@@ -205,7 +205,7 @@ export async function resolveEns(
   // See PRD_ERC4804.md for scope.
   let address: `0x${string}` | null;
   try {
-    address = await client.getEnsAddress({ name: lower });
+    address = await client.getEnsAddress({ name: lower, gatewayUrls: [] });
   } catch (e) {
     const detail = describeRpcFailure(e);
     return {
