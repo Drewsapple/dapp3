@@ -1,11 +1,15 @@
 import {
   createPublicClient,
   custom,
+  decodeFunctionResult,
+  encodeFunctionData,
   http,
   namehash,
   parseAbi,
+  toHex,
   type PublicClient,
 } from "viem";
+import { packetToBytes } from "viem/ens";
 import { mainnet } from "viem/chains";
 import { decode as decodeContentHash, getCodec } from "@ensdomains/content-hash";
 import { getSettings } from "@/lib/settings";
@@ -33,8 +37,13 @@ import {
 
 const RESOLVER_ABI = parseAbi([
   "function contenthash(bytes32 node) view returns (bytes)",
-  "function addr(bytes32 node) view returns (address)",
 ]);
+
+const RESOLVE_ABI = parseAbi([
+  "function resolve(bytes calldata name, bytes calldata data) view returns (bytes)",
+]);
+
+const UNIVERSAL_RESOLVER = mainnet.contracts.ensUniversalResolver.address;
 
 let heliosClientCache: PublicClient | null = null;
 let directClientCache: { url: string; client: PublicClient } | null = null;
@@ -58,6 +67,33 @@ function getDirectClient(url: string): PublicClient {
   });
   directClientCache = { url, client };
   return client;
+}
+
+/**
+ * Read contenthash via ENSIP-10 resolve() on the Universal Resolver, which
+ * handles wildcard resolution and delegation correctly.
+ */
+async function readContenthash(
+  client: PublicClient,
+  name: string,
+): Promise<`0x${string}`> {
+  const node = namehash(name);
+  const calldata = encodeFunctionData({
+    abi: RESOLVER_ABI,
+    functionName: "contenthash",
+    args: [node],
+  });
+  const res: `0x${string}` = await client.readContract({
+    address: UNIVERSAL_RESOLVER,
+    abi: RESOLVE_ABI,
+    functionName: "resolve",
+    args: [toHex(packetToBytes(name)), calldata],
+  });
+  return decodeFunctionResult({
+    abi: RESOLVER_ABI,
+    functionName: "contenthash",
+    data: res,
+  }) as `0x${string}`;
 }
 
 export type ResolveOptions = {
@@ -127,26 +163,9 @@ export async function resolveEns(
     }
   }
 
-  let resolverAddress: `0x${string}`;
-  try {
-    resolverAddress = (await client.getEnsResolver({
-      name: lower,
-    })) as `0x${string}`;
-  } catch (e) {
-    return {
-      ok: false,
-      error: `No ENS resolver for ${lower}: ${describeRpcFailure(e)}`,
-    };
-  }
-
   let raw: `0x${string}`;
   try {
-    raw = await client.readContract({
-      address: resolverAddress,
-      abi: RESOLVER_ABI,
-      functionName: "contenthash",
-      args: [namehash(lower)],
-    });
+    raw = await readContenthash(client, lower);
   } catch (e) {
     return {
       ok: false,
@@ -180,18 +199,13 @@ export async function resolveEns(
     };
   }
 
-  // ERC-4804 fallback: read addr() from the same resolver. If the address is
-  // a contract that implements ERC-5219 manual mode, fetch its HTML and pin
-  // it to local Kubo so we can serve via <cid>.ipfs.localhost. See
-  // PRD_ERC4804.md for scope.
-  let address: `0x${string}`;
+  // ERC-4804 fallback: resolve addr() via ENSIP-10-aware getEnsAddress. If
+  // the address is a contract that implements ERC-5219 manual mode, fetch its
+  // HTML and pin it to local Kubo so we can serve via <cid>.ipfs.localhost.
+  // See PRD_ERC4804.md for scope.
+  let address: `0x${string}` | null;
   try {
-    address = (await client.readContract({
-      address: resolverAddress,
-      abi: RESOLVER_ABI,
-      functionName: "addr",
-      args: [namehash(lower)],
-    })) as `0x${string}`;
+    address = await client.getEnsAddress({ name: lower });
   } catch (e) {
     const detail = describeRpcFailure(e);
     return {
